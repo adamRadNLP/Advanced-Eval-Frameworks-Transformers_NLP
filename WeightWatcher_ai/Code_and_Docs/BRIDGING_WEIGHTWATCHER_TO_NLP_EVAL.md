@@ -1,6 +1,6 @@
 # Bridging Structural Layer Diagnostics to Output-Level Semantic Evaluation
 * Author: Adam Lang
-* Date: 2026-03-25
+* Date: 03-25-2026
 
 ---
 
