@@ -1,0 +1,25 @@
+{
+  "model": "mistralai/Mistral-7B-Instruct-v0.3 + QLoRA (r=16)",
+  "adapter_path": "./sft_output/mistral-7b_20260324_1714/final",
+  "analysis_date": "2026-03-25T19:35:57.917434",
+  "base_model": {
+    "mean_alpha": 5.6293264246930725,
+    "median_alpha": 4.806473679976689,
+    "well_trained_pct": 72.12389380530973,
+    "undertrained_pct": 26.991150442477878,
+    "overtrained_pct": 0.8849557522123894,
+    "total_layers": 226
+  },
+  "fine_tuned_model": {
+    "mean_alpha": 4.672141966356334,
+    "median_alpha": 4.368802230359163,
+    "well_trained_pct": 84.95575221238938,
+    "undertrained_pct": 14.15929203539823,
+    "overtrained_pct": 0.8849557522123894,
+    "total_layers": 226
+  },
+  "lora_config": {
+    "rank": 16,
+    "alpha_note": "Rank 16 is small-n regime -- alpha estimates noisier. Look at trends, not individual values."
+  }
+}
