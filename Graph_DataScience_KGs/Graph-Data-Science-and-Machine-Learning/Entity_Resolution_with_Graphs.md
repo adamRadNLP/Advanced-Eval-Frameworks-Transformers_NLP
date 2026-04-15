@@ -6,6 +6,9 @@
 - GraphRAG with Amazon Neptune. Paco Nathan is a former Stanford processor and graph guru. He talks about the importance of entity resolution using AWS neptune: https://senzing.com/graphrag-amazon-aws-neptune-bedrock/
 - [Semantic Similarity in Radiology Reports via LLMs and NER](https://arxiv.org/html/2510.03102v2)
 - [The Rise of Semantic Entity Resolution](https://blog.graphlet.ai/the-rise-of-semantic-entity-resolution-45c48d5eb00a)
+- [KARGEN: Knowledge-enhanced Automated Radiology Report Generation Using Large Language Models](https://arxiv.org/html/2409.05370v1)
+- [Ontology-Based Concept Distillation for Radiology Report Retrieval and Labeling](https://arxiv.org/html/2508.19915v1)
+- ["Knowledge is Power": Constructing Knowledge Graph of Abdominal Organs and Using Them for Automatic Radiology Report Generation](https://aclanthology.org/2023.acl-industry.2.pdf)
 
 
 
