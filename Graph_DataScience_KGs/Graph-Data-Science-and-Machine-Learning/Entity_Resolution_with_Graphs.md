@@ -1,7 +1,14 @@
 # Entity Resolution with Graphs
-* This repo contains all things related to entity resolution with graphs.
+* This page contains a basic HIGH-LEVEL overview related to entity resolution with graphs.
+* This is by no means a complete overview. 
+---
+# Important Resources to check out:
+- GraphRAG with Amazon Neptune. Paco Nathan is a former Stanford processor and graph guru. He talks about the importance of entity resolution using AWS neptune: https://senzing.com/graphrag-amazon-aws-neptune-bedrock/
 
 
+
+
+---
 # Workflow 
 * These are my notes from the Neo4j Nodes 2024 Conference lecture: [A Graph Entity Resolution Playbook](https://www.youtube.com/watch?v=MfZR_ZrLSDw)
 
