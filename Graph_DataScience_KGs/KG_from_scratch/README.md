@@ -48,4 +48,7 @@ Storage: GraphFrames → Delta tables for Phase 2
 ---
 ## 4. Diagnostic KG Graph Agentic Rad System POC
 - These are notes from an agentic KG system an colleague and I built for Veterinary medicine. It was built with human radiology model components so it could be potentially useful.
-- However, not it was built with CLIP models in mind (they were using CLIP encoder models for image classification for FINDINGS text). CLIP is a model that Open AI released that embeds images and text in the same embedding space. 
+- However, not it was built with CLIP models in mind (they were using CLIP encoder models for image classification for FINDINGS text). CLIP is a model that Open AI released that embeds images and text in the same embedding space.
+---
+## 5. Custom RadGraph Architecture 
+- Document describing an approach to create a RadGraph-inspired veterinary radiology report evaluation using entity-relationship graphs. 
