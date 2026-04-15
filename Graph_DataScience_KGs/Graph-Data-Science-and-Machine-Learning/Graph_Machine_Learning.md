@@ -1,5 +1,5 @@
 # Graph Machine Learning
-* This repo is dedicated to machine learning with Graphs.
+* This page is dedicated to machine learning with Graphs.
 * An excellent resource is the open source course CS224W from Stanford which can be found on YouTube.
 * These are my notes from that open source course as well as some other resources. 
 
