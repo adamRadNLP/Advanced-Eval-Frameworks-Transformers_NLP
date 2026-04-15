@@ -1,0 +1,912 @@
+# Diagnostic Knowledge Graph Agentic Radiology System - Research & POC Plan
+
+## Context
+
+The goal is to build a **human-in-the-loop agentic veterinary radiology reporting system** that:
+1. Extracts diagnostic knowledge graphs (KGs) from a corpus of **canine radiograph reports**
+2. Aligns available information (from AI classifiers + radiologist input) to highest-matching graph paths
+3. Works with the **veterinary radiologist** to connect missing edges and generate a complete report
+4. Integrates existing **ViT+SigLIP condition/findings classifiers** and a hanging rules model (anatomy)
+
+**Domain**: Canine radiographs (X-ray studies, not CT)
+**Existing models**: ViT-based image encoder fine-tuned on canine images/reports with SigLIP loss + CXRBert text models
+This is for a **week-long hackathon POC**.
+
+---
+
+## Data
+
+### Source
+Parquet datasets from Unity Catalog: `/Volumes/overlook-dev/s3/overlook-dev/overlook_data/parquet/clipv2/`
+
+Mirrored locally to `data/train/` and `data/val/`.
+
+### Split Sizes
+| Split | Rows | Size |
+|-------|------|------|
+| **train** | 1,419,484 | ~1.6 GB |
+| **val** | 74,926 | ~97 MB |
+
+### Schema (11 columns)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `case` | object | Unique case identifier |
+| `breed` | str | Animal breed (e.g., "American Bulldog", "German Shepherd") |
+| `species` | str | Species (e.g., "Canine") |
+| `gender` | str | Gender + spay/neuter status (e.g., "Female, Spayed", "Male, Neutered") |
+| `weight_lbs` | float | Weight in pounds (note: some entries are 0.0) |
+| `case_notes` | str | Free-text clinical notes / presenting complaint from the referring vet |
+| `image_urls` | list[str] | S3 URLs to radiograph images (IDEXX ImgMgr) |
+| `image_asset_ids` | list[str] | DICOM-style asset identifiers for the images |
+| `report_input_ids` | list[int] | Tokenized radiology report (CXRBert token IDs) |
+| `report_attention_mask` | list[int] | Attention mask for the tokenized report (1 = real token, 0 = padding) |
+| `report` | str | **Detokenized full radiology report** (added locally via CXRBert BertTokenizer from `microsoft/BiomedVLP-CXR-BERT-specialized`) |
+
+### Report Structure
+The `report` column contains full radiology reports with a consistent structure:
+1. **Patient information**: species, breed, age (months), gender, weight
+2. **History**: clinical notes / presenting complaint
+3. **Findings**: detailed radiographic observations by body region, organized by view (lateral, VD/DV)
+4. **Conclusions/Impression**: differential diagnoses ranked by likelihood, recommendations
+
+### Notes
+- Reports are tokenized with the [microsoft/BiomedVLP-CXR-BERT-specialized](https://huggingface.co/microsoft/BiomedVLP-CXR-BERT-specialized) tokenizer (BERT WordPiece vocabulary)
+- The `report` column was reconstructed by decoding `report_input_ids` masked by `report_attention_mask` with `skip_special_tokens=True`
+- Some `weight_lbs` values are 0.0 (missing data)
+- Each case can have multiple images (list of URLs/asset IDs)
+- Reports vary in length and detail; some are brief pre-anesthetic workups, others are comprehensive multi-region studies
+
+---
+
+## Part 1: Source Review & Analysis
+
+### 1.1 KARGEN (Knowledge Enhanced Automated Radiology Report Generation)
+**Paper**: [arxiv.org/html/2409.05370v1](https://arxiv.org/html/2409.05370v1)
+
+**What it does**: Integrates LLMs (LLaMA2-7B) with a disease-specific knowledge graph for automated radiology report generation using a 3-layer GCN over 14 CheXpert disease entities.
+
+**Architecture**: Swin Transformer (visual features) -> GCN over disease KG -> Feature fusion (element-wise or MoE-style) -> LLaMA2-7B report generation
+
+**Key insight for our system**: Their KG is small (14 nodes) and static. Our approach should build **richer, dynamic KGs** from report corpora. However, their fusion approach (gating visual + graph features) is relevant for combining CLIP classifier outputs with KG paths.
+
+**Limitations**: Fixed 14-disease graph; no human-in-the-loop; no iterative refinement.
+
+---
+
+### 1.2 RadGraph / RadGraph-XL
+**Dataset**: [physionet.org/content/radgraph/1.0.0](https://physionet.org/content/radgraph/1.0.0/)
+**RadGraph-XL**: [aclanthology.org/2024.findings-acl.765](https://aclanthology.org/2024.findings-acl.765/)
+**Python package**: [github.com/Stanford-AIMI/radgraph](https://github.com/Stanford-AIMI/radgraph) (`pip install radgraph`)
+
+**What it provides**:
+- **Entity types**: ANAT-DP (anatomy present), OBS-DP (observation present), OBS-U (uncertain), OBS-DA (absent)
+- **Relation types**: `suggestive_of`, `located_at`, `modify`
+- **RadGraph-XL** (2024): 2,300 reports, 410K+ entities/relations, covers chest CT, abdomen/pelvis CT, brain MR, chest X-ray
+- **Trained models**: DYGIE++ on PubMedBERT, F1=0.82 (MIMIC-CXR)
+- **Python API**: `RadGraph(model_type="modern-radgraph-xl")` - extract entities/relations from any report text
+
+**Critical for our system**: RadGraph is the **foundation for KG extraction**. The `radgraph` Python package can directly extract entity-relation graphs from our report corpus. The entity/relation schema is well-suited for building diagnostic KGs. RadGraph-XL's multi-modality coverage (CT, MR, CXR) is a major advantage.
+
+---
+
+### 1.3 Semantic Entity Resolution (Graphlet.ai)
+**Source**: [blog.graphlet.ai](https://blog.graphlet.ai/the-rise-of-semantic-entity-resolution-45c48d5eb00a) (Medium paywall)
+
+**Concept**: Merging duplicate/variant entities in knowledge graphs using:
+- Embedding similarity (cosine threshold)
+- LLM-based disambiguation
+- UMLS normalization for medical terms
+- Graph structural features
+
+**Relevance**: After extracting entities from many reports, we'll have duplicates and variants (e.g., "cardiomegaly" vs "enlarged heart" vs "cardiac enlargement"). Entity resolution is **essential** for building a clean, unified KG. ReXKG uses 0.95 embedding similarity + ScispaCy/UMLS normalization - a practical approach we can adopt.
+
+---
+
+### 1.4 Google RadExtract / LangExtract
+**Demo**: [huggingface.co/spaces/google/radextract](https://huggingface.co/spaces/google/radextract)
+**Library**: [github.com/google/langextract](https://github.com/google/langextract) (`pip install langextract`)
+**Docs**: [developers.google.com/health-ai-developer-foundations/libraries/langextract](https://developers.google.com/health-ai-developer-foundations/libraries/langextract)
+
+**What it does**: LLM-powered structured extraction from unstructured text with precise source grounding. Uses Gemini 2.5 Flash/Pro. Few-shot learning, no fine-tuning needed. Returns structured JSON with character-level source attribution.
+
+**Key features**:
+- Schema-driven extraction (define what to extract)
+- Source grounding (every extraction maps to exact text location)
+- Interactive HTML visualization for verification
+- Handles long documents via chunking + parallel processing
+- Supports Gemini, OpenAI, Ollama (local models)
+
+**Relevance**: Could be used as an **alternative or complement to RadGraph** for KG extraction. Particularly useful for extracting textbook knowledge into structured form. The source grounding is valuable for the human-in-the-loop verification step.
+
+---
+
+### 1.5 Anthropic's Building Effective Agents Guide
+**Source**: [anthropic.com/engineering/building-effective-agents](https://www.anthropic.com/engineering/building-effective-agents)
+
+**Key patterns relevant to our system**:
+
+1. **Orchestrator-Workers**: Central LLM breaks tasks into subtasks for specialized workers. Maps to our system where an orchestrator manages the KG matching + radiologist interaction while delegating to CLIP classifiers, KG search, etc.
+
+2. **Evaluator-Optimizer**: Iterative refinement loop. Maps to the radiologist reviewing generated report sections and providing feedback.
+
+3. **Routing**: Classify input and direct to specialized handler. Maps to hanging rules model routing images to anatomy-specific processing paths.
+
+4. **Human-in-the-loop**: Agents should pause for human feedback at checkpoints. Core to our design.
+
+**Critical guidance**: "Start simple. Add complexity only when it demonstrably improves outcomes." For hackathon: start with prompt chaining, not a full multi-agent system.
+
+---
+
+## Part 2: Additional SOTA Methods Discovered
+
+### 2.1 ReXKG (Rajpurkar Lab, 2024)
+**Paper**: [arxiv.org/abs/2408.14397](https://arxiv.org/abs/2408.14397)
+**Code**: [github.com/rajpurkarlab/ReXKG](https://github.com/rajpurkarlab/ReXKG)
+
+**What it does**: Full pipeline for constructing radiology KGs from reports:
+1. GPT-4 annotation -> PURE NER/RE training
+2. Entity extraction (anatomy, disorder, concept, device, procedure, size)
+3. Node construction (ScispaCy + UMLS normalization, 0.95 embedding similarity merging)
+4. Edge construction (triplet dedup, frequency filtering >= 5 occurrences)
+
+**3 evaluation metrics**: KG-NSC (node similarity), KG-AMS (edge distribution), KG-SCS (subgraph coverage)
+
+**Key finding**: Generalist models achieve ~80% entity coverage but miss complex relationships. The top 10% most frequent subgraphs capture the most important diagnostic patterns.
+
+**Relevance**: ReXKG provides a **complete, open-source pipeline** for our KG construction step. Their frequency-based subgraph importance aligns perfectly with our concept of matching to "highest matching graph paths."
+
+### 2.2 R2GenKG (2025)
+**Paper**: [arxiv.org/html/2508.03426](https://arxiv.org/html/2508.03426)
+
+**What it does**: Builds M3KG (Multi-Modal Medical KG) with 2,477 entities, 37K+ triples, and disease-aware vision tokens. Uses multi-scale graph representations (coarse to fine) with R-GCN encoding and bidirectional cross-attention between vision and KG features.
+
+**Key innovation**: Multi-scale graph views - coarse subgraphs filter noise, fine-grained graphs retain detail. Achieves SOTA on IU X-Ray (BLEU-4: 0.181, CIDEr: 0.701).
+
+**Relevance**: The multi-scale graph concept is valuable for our path matching - start with coarse anatomy-level matching, then drill down to finding-level detail.
+
+### 2.3 BiomedCLIP
+**Paper**: [arxiv.org/abs/2303.00915](https://arxiv.org/abs/2303.00915)
+
+Pretrained on 15M biomedical image-text pairs from PMC. Outperforms radiology-specific models (BioViL) on tasks like RSNA pneumonia detection. Available on HuggingFace. Directly applicable as the backbone for condition and findings classifiers.
+
+### 2.4 Agentic AI in Radiology (2025 Literature)
+**Key papers**:
+- [Agentic AI in Radiology: Emerging Potential](https://pmc.ncbi.nlm.nih.gov/articles/PMC12515039/)
+- [Agentic AI Evolution to Clinical Integration](https://pubs.rsna.org/doi/10.1148/ryai.250651)
+- [GE Healthcare: Reinventing Radiology Workflows](https://research.gehealthcare.com/patient-care-pathways/reinventing-radiology-imaging-workflows-with-agentic-ai-jb35459xx/)
+
+**Consensus**: Agentic AI in radiology is at proof-of-concept stage. Key design principles:
+- Structured reasoning traces reviewable by radiologists
+- Pause for human validation at clinical decision points
+- Maintain radiologist as final authority
+- Focus on cognitive support, not replacement
+
+### 2.5 MCP Knowledge Graph Servers
+- [Neo4j MCP for Claude](https://neo4j.com/blog/developer/knowledge-graphs-claude-neo4j-mcp/) - natural language to Cypher queries
+- [Knowledge Graph Memory Server](https://github.com/modelcontextprotocol/servers) - persistent entity/relation storage
+- These provide ready-made infrastructure for a Claude Code-based agentic approach
+
+### 2.6 Veterinary-Specific Research
+
+**Companion Animal Disease KG** ([arxiv.org/abs/2309.03219](https://arxiv.org/abs/2309.03219)):
+- LiteralKG model builds KGs from veterinary EMRs across animal hospitals
+- Uses gate networks to fuse entity types with literal attributes into unified representations
+- Self-supervised pretraining on graph structure for downstream diagnostic tasks
+- Outperforms SOTA on link prediction (disease relationship prediction)
+- Code is publicly available
+
+**ACVR/ECVDI Consensus on Imaging Reports** ([PMC11649853](https://pmc.ncbi.nlm.nih.gov/articles/PMC11649853/)):
+- Canonical vet radiology report structure: **Header -> Findings -> Impression -> Signature**
+- Findings section: "all abnormal observations and pertinent normal findings" with standardized technical language
+- Impression section: clinical context, differential diagnoses, recommendations
+- Diagnosis format: **severity + acuity + distribution** (e.g., "Severe, acute gastric dilatation-volvulus")
+- Emphasizes definitive diagnoses when confident, prioritized differentials when uncertain
+- **This defines our KG's target output schema**
+
+**SignalRAY/SignalPET (Commercial Reference)** ([Frontiers 2025](https://www.frontiersin.org/journals/veterinary-science/articles/10.3389/fvets.2025.1502790/full)):
+- 38 deep learning architectures, trained on 2.5M+ canine/feline radiographs from 3,000+ practices
+- Provides binary normal/abnormal classification per finding
+- Matches best radiologist accuracy, more specific but less sensitive
+- Cannot provide differential diagnoses or clinical context - **exactly the gap our system fills**
+
+**VetSCT (Veterinary SNOMED-CT Extension)** ([vtsl.vetmed.vt.edu](https://vtsl.vetmed.vt.edu/extension/)):
+- Maintained by Virginia Tech Center for Veterinary Terminology and Standards
+- Extends SNOMED-CT with animal-specific content
+- Browsable terminology database (Feb 2025 release)
+- Requires signup and approval process -- **deferred to post-hackathon**
+- For POC, CXRBert embeddings + LLM-based normalization provide equivalent entity resolution without external dependencies
+
+---
+
+## Part 2.7: Tool Transferability Assessment (Human -> Veterinary)
+
+| Tool | Transferability | Adaptation Needed |
+|------|----------------|-------------------|
+| **RadGraph schema** (entity/relation types) | HIGH | Schema concept (ANAT, OBS, relations) transfers directly. Canine anatomy entities differ but structure is identical |
+| **RadGraph trained models** | LOW-MEDIUM | Trained on human reports. May extract some findings but will miss vet-specific anatomy. Test first, likely need LLM-based extraction instead |
+| **LangExtract** | HIGH | Domain-agnostic, few-shot. Define vet-specific schema + examples and it works on canine reports immediately |
+| **ReXKG pipeline methodology** | HIGH | The approach (NER -> normalization -> graph construction -> frequency filtering) transfers completely. Use CXRBert embeddings + LLM for normalization instead of UMLS |
+| **ScispaCy** | MEDIUM | Biomedical NER works for some vet terms, but trained on human literature. Supplement with LLM-based extraction |
+| **NetworkX / Neo4j** | HIGH | Completely domain-agnostic |
+| **Entity resolution approach** | HIGH | Embedding similarity + LLM-based synonym resolution. CXRBert provides domain-specific embeddings; no external ontology needed for POC |
+| **Anthropic agent patterns** | HIGH | Architecture patterns are domain-agnostic |
+
+**Recommended approach for vet domain**: Use **LangExtract or direct LLM prompting** (Claude/Gemini) for entity/relation extraction from canine reports, with a vet-specific schema based on RadGraph's structure adapted for canine anatomy. This avoids dependency on human-trained NER models.
+
+---
+
+## Part 3: Agentic Framework Comparison
+
+### Option A: Claude Code with Skills/MCPs
+**Pros**:
+- Fastest to prototype (you already have the environment)
+- MCP servers for Neo4j, knowledge graphs already exist
+- Skills can encapsulate complex workflows
+- Human-in-the-loop is native (the radiologist IS the user)
+- Follows Anthropic's "start simple" guidance
+- Direct access to Claude's reasoning for graph path matching
+
+**Cons**:
+- Less structured multi-agent orchestration
+- Harder to integrate custom CLIP models (would need MCP wrapper)
+- Single-threaded conversation model
+
+### Option B: CrewAI / Bespoke Framework
+**Pros**:
+- Purpose-built multi-agent coordination
+- Role-based agents (KG agent, classifier agent, report writer agent)
+- Better for production deployment
+- 5.76x faster execution than LangGraph in benchmarks
+
+**Cons**:
+- More setup time (significant for a hackathon)
+- Need to build the human-in-the-loop interaction from scratch
+- Framework overhead for what may be a sequential workflow
+- Overkill if the core logic is actually a pipeline, not truly multi-agent
+
+### Recommendation for Hackathon: **Hybrid Approach**
+Use Claude Code as the orchestrator and human interface, with MCP servers wrapping the KG database and CLIP classifiers. This gives you:
+- Natural human-in-the-loop (radiologist talks to Claude)
+- MCP-based tool access to KG queries, CLIP inference, report templates
+- Fast prototyping with the option to extract into a standalone system later
+
+---
+
+## Part 4: Available Building Blocks (Vet-Adapted)
+
+| Component | Tool | Install | Vet Adaptability |
+|-----------|------|---------|-----------------|
+| **KG Extraction (primary)** | LangExtract (Google) | `pip install langextract` | Domain-agnostic, define vet schema + few-shot examples |
+| **KG Extraction (alt)** | Direct LLM prompting (Claude API) | `pip install anthropic` | Full control, define RadGraph-like schema for canine anatomy |
+| **KG Extraction (test)** | `radgraph` (Stanford AIMI) | `pip install radgraph` | Test on vet reports - may partially work, good baseline |
+| **KG Pipeline Reference** | ReXKG methodology | GitHub clone | Adapt pipeline approach, use CXRBert + LLM instead of UMLS |
+| **Graph Database** | Neo4j + MCP | Docker + pip | Domain-agnostic, MCP server exists for Claude |
+| **Graph Database (lightweight)** | NetworkX | `pip install networkx` | Domain-agnostic, good for POC |
+| **Image Classifiers** | Your ViT+SigLIP models | Already trained | Canine conditions + findings, ready to integrate |
+| **Text Encoder** | Your CXRBert models | Already trained | Canine report text understanding |
+| **Entity Resolution** | CXRBert embeddings + LLM | Your CXRBert + Claude API | Domain-specific similarity clustering + LLM canonical name selection |
+| **Report Corpus** | Your canine radiograph reports | Already have | The primary data source for KG construction |
+| **Report Structure** | ACVR/ECVDI consensus format | Reference doc | Header -> Findings -> Impression -> Signature |
+
+---
+
+## Part 5: Hackathon POC Architecture (Draft)
+
+### Core Concept: "Graph-Guided Veterinary Radiology Co-Pilot"
+
+```
+                    +---------------------+
+                    | Vet Radiologist      |
+                    | (Human User)         |
+                    +--------+------------+
+                             |
+                    Claude Code / Agent
+                    (Orchestrator)
+                             |
+         +-------------------+-------------------+
+         |                   |                   |
+   MCP: KG Query      MCP: Classifiers    MCP: Report
+   (Neo4j/NX)         (Your ViT+SigLIP)   Generator
+         |                   |                   |
+    +----+----+        Conditions +         ACVR Format
+    |         |        Findings +           + LLM Fill
+  Canine    Textbook   Anatomy(Hanging)
+  Diag KG   KG/RAG
+  (from your (from vet
+  reports)   textbooks)
+```
+
+### Workflow Concept
+
+1. **Study arrives** -> Hanging rules model identifies anatomy/body region
+2. **Classifiers run** -> ViT+SigLIP models produce condition + finding predictions with confidence scores
+3. **Graph matching** -> Predictions mapped to KG nodes; find highest-matching diagnostic subgraph paths
+4. **Gap analysis** -> Agent identifies missing edges (e.g., "model detects cardiomegaly but no vertebral heart score measurement")
+5. **Radiologist interaction** -> Agent presents matched paths + gaps to vet radiologist, asks targeted questions
+6. **Report generation** -> Complete graph path converted to ACVR-format report (Findings + Impression)
+
+### Confirmed Resources
+- **10,000+ canine radiograph reports** (primary KG source)
+- **ViT+SigLIP condition + findings classifiers** (trained, ready to integrate)
+- **CXRBert text encoder** (trained on canine reports)
+- **Hanging rules model** (anatomy identification, trained)
+- **Vet radiology textbook content** (secondary knowledge source)
+
+### Proposed POC Scope (1-week hackathon)
+
+**Primary goals**: (1) KG construction quality, (2) Agentic workflow
+**Stretch goal**: End-to-end integrated demo
+
+---
+
+#### Phase 1 (Days 1-2): Knowledge Graph Construction from Canine Reports
+
+**1a. Define entity/relation schema** (adapted from RadGraph for canine anatomy + ACVR report format):
+
+```
+Entity Types:
+  - ANATOMY       (body region/structure, e.g., "thorax", "left stifle", "caudal vena cava")
+  - FINDING       (radiographic observation, e.g., "increased opacity", "periosteal reaction")
+  - CONDITION     (diagnosis/disease, e.g., "cardiomegaly", "hip dysplasia", "GDV")
+  - MODIFIER      (severity/acuity/distribution per ACVR, e.g., "severe", "chronic", "diffuse")
+
+Relation Types:
+  - located_at     (FINDING -> ANATOMY)
+  - suggestive_of  (FINDING -> CONDITION, or FINDING -> FINDING)
+  - modify         (MODIFIER -> FINDING/CONDITION)
+  - differential_for (CONDITION -> CONDITION, ordered by likelihood)
+  - absent         (negated FINDING at ANATOMY)
+```
+
+**1b. Extract entities/relations from report corpus** (mixed format - some structured, some free-text):
+- First: parse structured reports to separate Findings/Impression sections where available
+- For free-text reports: use LLM to identify section boundaries
+- ~~Option A (recommended): Use **Claude API** with structured output schema + few-shot examples from your reports~~
+- ~~Option B: Use **LangExtract** (Gemini-powered, source grounding, batch processing)~~
+- **IMPLEMENTED**: Using **Gemini 2.5 Flash** on Vertex AI with Pydantic JSON schema enforcement (see `extract.py`)
+- Sample 500-1000 reports for initial extraction, validate, then scale to full 10K+
+- Run extraction in batches with parallel processing
+
+**1c. Entity resolution (CXRBert + LLM approach, no external ontology required)**:
+1. Embed all extracted entities using **CXRBert CLIP text encoder v4** (`overlook-dev.radiology_classifier.clip_rad_dino/4`), 768-dim embeddings — v4 projection head fine-tuned on full anatomy radiographs (v7 is abdomen-only)
+2. Cluster entities by cosine similarity using **per-type thresholds** (ANATOMY=0.93, FINDING=0.95, CONDITION=0.93, MODIFIER=0.97) — higher thresholds for types where CXRBert poorly discriminates short generic words. Agglomerative clustering with complete linkage (all pairs within cluster must meet threshold).
+3. For each multi-member cluster, use **Gemini 2.5 Flash** to select the **canonical name** (most specific/standard term). Chosen over Gemini 3 Flash Preview after comparison: 2.5 Flash is faster, more conservative (picks existing cluster members 83% of the time), and more reliable. See `output/llm_canonical_comparison.md`.
+4. Merge cluster members into single KG nodes with aliases preserved
+
+This approach is stronger than ontology-based normalization for our domain because CXRBert understands the actual language our radiologists use. VetSCT integration is deferred to post-hackathon (see Future Work).
+
+**1c-augmented. LLM-augmented entity resolution (A+B hybrid)**:
+
+Baseline entity resolution (1c above) achieves precision=86.4%, recall=63.7%, F1=0.734 on the 206-pair evaluation set. The embedding-based approach struggles with short generic words and misses abbreviation/synonym pairs that fall below the cosine threshold. Augment with two LLM passes:
+
+**Pass A — Cluster Validation (precision fix)**:
+- For each multi-member cluster from step 1c.2, send to LLM: "Are all of these terms truly synonymous in veterinary radiology? If not, which should be split out?"
+- Split clusters where the LLM identifies false merges
+- Cost: ~1,696 LLM calls (~$0.50-1.00), ~15 min
+- Target: precision 86.4% → **≥95%**
+
+**Pass B — Near-Threshold Pair Rescue (recall fix)**:
+- Identify entity pairs that fall just below the clustering threshold (e.g., cosine similarity 0.80–0.93 for ANATOMY/CONDITION, adjusted per type)
+- Send borderline pairs to LLM: "Are these two veterinary radiology terms synonymous?"
+- Merge confirmed pairs into existing or new clusters
+- Catches: abbreviations (GDV ↔ gastric dilatation-volvulus), lay-vs-medical terms, multi-word rephrasings
+- Cost: ~500-2,000 LLM calls (~$0.50-2.00), ~15-20 min
+- Target: recall 63.7% → **≥80%**
+
+Combined target: **precision ≥95%, recall ≥80%, F1 ≥0.87**. Evaluate against the 206-pair benchmark set.
+
+Precision is prioritized over recall because false merges create incorrect diagnostic paths in the KG (clinically dangerous), while missed merges only fragment the graph (compensated at query time by soft node matching — see 2e).
+
+**Pass C — Abbreviation / Acronym Lookup (TODO)**:
+- Projection-based evaluation reveals that short medical abbreviations (CCL, GDV, IVDD, CVC) are unsolvable by CXRBert CLIP — they embed into generic regions (e.g., "CCL" → "tall" at sim=0.991, "GDV" → "vhs" at sim=0.890, "IVDD" → "liver atrophy" at sim=0.637)
+- Longer/more distinctive abbreviations fare better: CHF → "congestive heart failure" (correct), DJD → "degenerative joint disease" (correct)
+- **Solution**: curate or LLM-generate a veterinary radiology abbreviation lookup table mapping acronyms to their full expansions, and apply it as a pre-processing step before embedding
+- Alternatively, add a Pass C that specifically targets short uppercase tokens (≤5 chars, all caps) and asks the LLM to expand them before resolution
+- Expected to recover most of the remaining FN pairs in the projected evaluation (8 TP → potentially 12-15+ TP)
+
+**1d. Build and analyze KG**:
+- Construct in **Neo4j** (graph database with Cypher queries, visualization, MCP integration)
+- Run Neo4j via Docker locally
+- Filter edges by frequency (>= 5 occurrences, per ReXKG)
+- Compute subgraph frequency and importance scores
+- Identify **top diagnostic paths**: anatomy -> finding(s) -> condition with modifiers
+- Also maintain NetworkX representation for algorithmic analysis (path finding, subgraph matching)
+
+---
+
+#### Phase 2 (Days 3-4): Agent + Tool Integration
+
+**2a. MCP Server: KG Query Tool**
+```
+Tools:
+  - query_diagnostic_paths(findings: list[str]) -> ranked matching paths
+  - get_subgraph(condition: str) -> all connected findings/anatomy/modifiers
+  - find_missing_edges(partial_graph: dict) -> suggested completions
+  - get_differentials(findings: list[str], anatomy: str) -> ranked conditions
+```
+
+**2b. MCP Server: Classifier Integration** (wrapping the deployed Vertex AI abdomen classifier service)
+```
+Tools:
+  - classify_abdomen(image_path: str, patient: dict) -> list[(condition, prediction, confidence)]
+    # Proxies to Vertex AI /infer endpoint (CLIP v2 + 13 abdomen classifiers)
+  - get_clip_embeddings(image_path: str, patient: dict) -> {image_embeddings, text_embeddings}
+    # Proxies to Vertex AI /embed endpoint (768-dim CLIP embeddings)
+  - identify_anatomy(image_path: str) -> anatomy region + hanging protocol
+    # Calls hanging rules model (TBD — may also be deployed as a service)
+```
+Implementation: Python MCP server that proxies to the existing Vertex AI Prediction Endpoint (`local-abdomen-service` in `aicoe-poseidon-prod`). Auth via `gcloud auth print-access-token`. Images encoded as base64 before sending.
+
+**2c. MCP Server: Textbook RAG** (if time)
+```
+Tools:
+  - lookup_diagnostic_criteria(condition: str) -> textbook description + expected findings
+  - validate_finding_condition_link(finding: str, condition: str) -> textbook evidence
+```
+
+**2d. Claude Code Skills**:
+- `analyze-study`: Full workflow skill that runs classifiers, matches to KG, presents to radiologist
+- `build-report`: Takes confirmed graph paths and generates ACVR-format report
+- `explore-kg`: Interactive KG exploration and visualization
+
+**2e. Graph path matching algorithm (with soft node matching)**:
+- Input: classifier predictions (conditions + findings + anatomy)
+- **Soft node matching**: Map each prediction to top-K candidate KG nodes by CXRBert embedding similarity (not just nearest-1). Weight candidates by match quality score `s_match = cosine_sim(query, node)`. This compensates for residual entity resolution fragmentation — if "liver enlargement" and "hepatomegaly" are separate nodes, a query for "enlarged liver" activates both with appropriate weights.
+- **Neighborhood expansion**: For each candidate node, retrieve its local subgraph (1-2 hop neighborhood). Union overlapping neighborhoods weighted by match score.
+- **Path finding**: Find all diagnostic paths (ANATOMY ← FINDING → CONDITION) that pass through any activated node.
+- **Composite path scoring**: Score each path by:
+  - (a) `s_match`: node match quality (how well did the query term match the path's nodes)
+  - (b) `s_freq`: path frequency in KG (edge frequency, importance_score)
+  - (c) `s_complete`: path completeness (fraction of classifier predictions covered by this path)
+  - Combined: `score = s_match^α × s_freq^β × s_complete^γ` (tune weights on held-out cases)
+- Return top-K paths with gap analysis (missing edges)
+- See research notes on soft matching: spreading activation (Collins & Loftus 1975), PersonalizedPageRank for local subgraph scoring, and KGQA soft entity linking (ELQ, BLINK)
+
+---
+
+#### Phase 3 (Days 5-6): Human-in-the-Loop Workflow
+
+**The core interaction loop** (Anthropic's Evaluator-Optimizer pattern):
+
+```
+1. Agent: "I analyzed the thoracic radiograph. Here's what I found:"
+   - Lists classifier predictions with confidence
+   - Shows top 3 matching diagnostic paths from KG
+   - Highlights missing edges: "I see increased bronchointerstitial opacity
+     but need your assessment of distribution pattern (focal vs diffuse)"
+
+2. Radiologist: Confirms/rejects findings, provides missing info
+
+3. Agent: Updates graph, re-matches, presents refined paths
+   - "With diffuse pattern confirmed, top differential path is:
+     diffuse bronchointerstitial opacity -> suggestive_of -> chronic bronchitis
+     (seen in 847 reports) vs allergic bronchitis (312 reports)"
+
+4. Radiologist: Selects/modifies diagnosis
+
+5. Agent: Generates ACVR-format report draft from completed path
+   - Findings section: All observations + pertinent normals
+   - Impression section: Diagnosis (severity + acuity + distribution) + differentials + recommendations
+
+6. Radiologist: Reviews, edits, approves
+```
+
+---
+
+#### Phase 4 (Day 7): Demo & Polish / Stretch: End-to-End Integration
+
+- Wire up all components for live demo with sample canine cases
+- KG visualization (NetworkX -> matplotlib or pyvis for interactive graph)
+- Performance metrics on a held-out test set
+- Documentation and presentation materials
+
+---
+
+## Progress Log
+
+### Session 1 — 2026-02-14
+
+**Phase 1a: Schema — DONE**
+- Entity/relation schema implemented as Pydantic models in `kg_schema.py`
+- 4 entity types (ANATOMY, FINDING, CONDITION, MODIFIER) + 5 relation types
+
+**Phase 1b: Extraction — DONE (initial batch)**
+- Built report section parser (`report_parser.py`) — splits reports into patient_info, history, study_info, findings, conclusions
+  - 96% of reports have explicit `findings:` section, 89% have `conclusions:`
+- Built extraction pipeline (`extract.py`) using **Gemini 2.5 Flash** on Vertex AI (not Claude API — chose Gemini since we're in GCP)
+  - Structured JSON output enforced via Pydantic schema
+  - System prompt with schema definitions + 1 few-shot example
+  - Sync, async, and batch modes with configurable concurrency
+- Ran on **100 reports** (`output/extraction_100.json`):
+  - 4,449 entities, 3,530 relations (median 42 entities / 32 relations per report)
+  - 99% success rate (1 empty extraction)
+  - 4.4s/report effective at concurrency=10
+  - Entity distribution: FINDING 37.7%, ANATOMY 32.5%, CONDITION 15.3%, MODIFIER 14.4%
+  - Relation distribution: located_at 44.1%, modify 20.9%, absent 14.4%, suggestive_of 13.6%, differential_for 7.0%
+  - Cost: ~$0.001/report
+
+**Phase 1c: Entity Resolution — DONE**
+- Downloaded and loaded **CXRBert CLIP text encoder** (`CXRBertRadDinoCLIPModel` v7) from Databricks MLflow
+  - Model: `overlook-dev.radiology_classifier.clip_rad_dino/7`
+  - HuggingFace modules: `models/BiomedVLP-CXR-BERT-specialized/` (downloaded from Databricks Volumes)
+  - Deserialization requires `overlook-models` wheel built from `github.com/idexx-laboratories/daicoe-overlook` (dev branch)
+  - Loading handled by `load_clip_model.py` (registers custom `transformers_modules` for unpickling)
+  - 768-dim embeddings, GPU-accelerated
+- Validated embedding quality on curated term pairs (21-pair initial set):
+  - Synonyms cluster tightly: `hepatomegaly` ↔ `liver enlargement` = 0.961, `small intestines` ↔ `small intestine` = 0.962
+  - Related-but-distinct separate: `normal` ↔ `unremarkable` = 0.807, `mild` ↔ `moderate` = 0.801
+  - Unrelated terms well-separated: `cardiomegaly` ↔ `bronchitis` = 0.304
+- **V4 vs V7 comparison** on 206-pair expanded test set (`eval_clip_versions.py` → `output/clip_version_comparison.md`):
+  - Both versions near-identical at 0.93 threshold: zero classification disagreements
+  - V4 marginally better F1 at lower thresholds (0.813 @ 0.89 vs 0.790 @ 0.88)
+  - **Decision: use v4** — projection head fine-tuned on full anatomy radiographs (v7 is abdomen-only)
+- **Recommended threshold: 0.93 cosine similarity** — precision=86.4%, recall=63.7%, F1=0.734 on 206-pair set
+- Built full resolution pipeline (`bonegodkg/resolve.py`):
+  - Agglomerative clustering with complete linkage (scipy)
+  - **Per-type thresholds**: ANATOMY=0.93, FINDING=0.95, CONDITION=0.93, MODIFIER=0.97
+    - CXRBert poorly discriminates short generic words; higher thresholds for FINDING/MODIFIER prevent garbage clusters
+  - **Canonical name selection**: Gemini 2.5 Flash on Vertex AI (batched, async)
+  - Ran on 1,000-report corpus: 9,733 unique entities → 6,763 clusters (30.5% reduction)
+    - ANATOMY: 2,794 → 1,604 (42.6% reduction, 615 multi-member)
+    - CONDITION: 2,377 → 1,562 (34.3% reduction, 445 multi-member)
+    - FINDING: 3,743 → 2,867 (23.4% reduction, 578 multi-member)
+    - MODIFIER: 819 → 730 (10.9% reduction, 58 multi-member)
+  - CONDITION clusters: excellent quality (e.g., "spondylosis deformans" merges 10 variants)
+  - ANATOMY: good, some laterality merging acceptable
+  - FINDING/MODIFIER: improved with higher thresholds but some noise for short generic words
+- **LLM comparison**: Gemini 2.5 Flash vs Gemini 3 Flash Preview (`output/llm_canonical_comparison.md`)
+  - 71.1% agreement on 1,696 multi-member clusters
+  - **Decision: use Gemini 2.5 Flash** — conservative (picks existing cluster member 83% vs 34%), faster (21 min vs 36 min), more reliable
+  - Gemini 3 Flash tends to synthesize/generalize terms not in the cluster, which is risky for traceability
+- Outputs: `output/resolution_1000.json`, `output/resolution_1000_clusters.json`
+
+**Phase 1d: Graph Construction — DONE**
+- Built `bonegodkg/graph.py` — full KG construction from extraction + resolution outputs
+  - `build_graph()`: aggregates entities/relations, applies resolution map, filters by frequency
+  - `find_diagnostic_paths()`: ANATOMY ← FINDING → CONDITION triads with modifiers + importance scoring
+  - `find_pertinent_negatives()`: FINDING -[absent]→ ANATOMY patterns
+  - `graph_to_dict()` / `save_graphml()` for serialization
+- Built `scripts/run_graph.py` — CLI runner with argparse (--min-freq, --no-absent, --graphml)
+- **Results on 1,000 reports** (min_edge_freq=5):
+  - Pre-filter: 7,909 unique nodes, 19,215 unique edges
+  - **Final: 430 nodes, 712 edges, 11 connected components**
+  - Nodes by type: ANATOMY=150, FINDING=185, CONDITION=50, MODIFIER=45
+  - Edges by type: located_at=344, modify=157, absent=147, suggestive_of=48, differential_for=16
+  - Edge frequency: min=5, max=209, mean=14.6, median=8
+  - **143 diagnostic paths**, **147 pertinent negatives**
+  - Top edge: `gas -[located_at]→ stomach` (freq=209)
+- Outputs: `output/graph_1000.json`, `output/graph_1000_stats.json`, `output/graph_1000.graphml`
+
+**Neo4j Docker Integration — DONE**
+- Docker Compose at project root: Neo4j 5 Community Edition (ports 7474/7687, auth neo4j/bonegodkg)
+- Built `bonegodkg/neo4j_loader.py` — batched UNWIND+MERGE loader (nodes by type, edges by relation type)
+  - `get_driver()`, `create_constraints()`, `clear_graph()`, `load_graph()`, `get_stats()`
+  - Node labels: ANATOMY, FINDING, CONDITION, MODIFIER (with node_id, canonical, report_frequency)
+  - Relationship types: LOCATED_AT, SUGGESTIVE_OF, MODIFY, ABSENT, DIFFERENTIAL_FOR (with frequency)
+- Built `scripts/load_neo4j.py` — CLI with --clear, --input, --uri, --user, --password
+- Loaded 430 nodes + 712 edges; browse at http://localhost:7474
+- `neo4j` Python driver added to `pyproject.toml`
+
+**Environment setup completed**:
+- GCP Vertex AI workbench (`g2-standard-8`, NVIDIA L4 GPU)
+- Python 3.11, uv for dependency management
+- `google-genai`, `pydantic`, `ipykernel`, `matplotlib` added to `pyproject.toml`
+- `overlook-models` wheel installed (from daicoe-overlook dev branch)
+- GitHub CLI authenticated (`gh auth login`)
+- Databricks CLI v0.288.0 authenticated (profile: `overlook-dev`)
+
+**Notebooks**:
+- `notebooks/01_eda_and_extraction.ipynb` — Dataset EDA + extraction results analysis
+- `notebooks/02_cxrbert_embeddings.ipynb` — CXRBert embedding evaluation + entity resolution threshold analysis
+
+**Key files**:
+| File | Purpose |
+|------|---------|
+| `report_parser.py` | Splits raw reports into sections |
+| `kg_schema.py` | Pydantic models for entity/relation schema |
+| `extract.py` | Gemini 2.5 Flash extraction pipeline (sync/async/batch) |
+| `run_batch.py` | Batch extraction runner with stats |
+| `load_clip_model.py` | CXRBert CLIP model loader with custom module registration |
+| `output/extraction_100.json` | 100-report extraction results |
+| `models/clip_rad_dino/` | MLflow CLIP model artifact |
+| `models/BiomedVLP-CXR-BERT-specialized/` | HuggingFace CXRBert tokenizer + modules |
+
+### Session 2 — 2026-02-16
+
+**Package restructuring — DONE**
+- Reorganized codebase into `bonegodkg/` Python package (editable install via hatchling)
+  - `bonegodkg/schema.py` (was `kg_schema.py`), `bonegodkg/parser.py` (was `report_parser.py`)
+  - `bonegodkg/extract.py`, `bonegodkg/resolve.py`, `bonegodkg/clip.py`, `bonegodkg/gcs.py`
+- Scripts moved to `scripts/` — `run_batch.py`, `eval_clip_versions.py`, `run_resolve.py`, `run_graph.py`
+- Initial commit: `a66efa5`
+
+### Session 3 — 2026-02-16/17
+
+**Phase 1b scaled — DONE**
+- Ran extraction on **1,000 reports** (was 100): `output/extraction_1000.json`
+  - 41K entities, 33K relations across 1,000 reports
+
+**Phase 1c full run — DONE**
+- Entity resolution on 1,000-report corpus: 9,733 unique → 6,763 clusters (30.5% reduction)
+- Per-type thresholds tuned: ANATOMY=0.93, FINDING=0.95, CONDITION=0.93, MODIFIER=0.97
+- Gemini 2.5 Flash canonical name selection for 1,696 multi-member clusters
+- Outputs: `output/resolution_1000.json`, `output/resolution_1000_clusters.json`
+
+**Phase 1d — DONE**
+- Knowledge graph built: **430 nodes, 712 edges** (min_edge_freq=5)
+- 143 diagnostic paths, 147 pertinent negatives, 11 connected components
+- Outputs: `output/graph_1000.json`, `output/graph_1000_stats.json`, `output/graph_1000.graphml`
+- Commit: `67211f4`
+
+**Phase 1c-augmented — DONE**
+- LLM-augmented entity resolution notebook: `notebooks/05_augmented_entity_resolution.ipynb`
+- Pass A (cluster validation): split 1,374 over-merged clusters (precision fix)
+- Pass B (near-threshold pair rescue): 2,000 candidate pairs evaluated, merged confirmed synonyms (recall fix)
+- Final: 9,733 unique entities → 7,920 clusters (18.6% reduction), 1,118 multi-member clusters
+- Outputs: `output/resolution_1000_augmented.json`, `output/resolution_1000_augmented_clusters.json`
+- Commit: `a941c30`
+
+### Session 4 — 2026-02-18
+
+**Neo4j Docker Integration — DONE**
+- Created `docker-compose.yml` (Neo4j 5 Community, ports 7474/7687, auth neo4j/bonegodkg)
+- Created `bonegodkg/neo4j_loader.py` — batched UNWIND+MERGE loader with constraints
+- Created `scripts/load_neo4j.py` — CLI runner with --clear, --input, --uri, --user, --password
+- Added `neo4j` driver to `pyproject.toml`, `neo4j/` to `.gitignore`
+- Loaded 430 nodes + 712 edges into Neo4j; browsable at http://localhost:7474
+- Ready for Phase 2a (MCP server for KG queries via Cypher)
+
+**Marimo Interactive Explorer — DONE**
+- `notebooks/06_kg_explorer.py` — 6-tab interactive KG explorer
+- Tabs: Overview, Network Explorer, Node Inspector, Diagnostic Paths, Pertinent Negatives, Cypher Playground
+- Run: `marimo run notebooks/06_kg_explorer.py --host 0.0.0.0 --port 8081`
+
+**Abdomen Classifier Service (Vertex AI) — DONE**
+- GPU-backed inference service: **CLIP v2 + 13 abdomen condition classifiers** on Vertex AI Prediction Endpoint
+- Source code: `daicoe-overlook/infra/containers/api/local-abdomen-service/` (separate repo)
+- FastAPI app with endpoints: `/health`, `/models`, `/infer`, `/embed`
+- Takes canine radiograph images (base64) + patient metadata → returns condition predictions + CLIP embeddings
+- **GCP resources**: `aicoe-poseidon-prod`, `us-central1`, `g2-standard-4` + 1x NVIDIA L4 GPU
+- **Artifact Registry**: `us-central1-docker.pkg.dev/aicoe-poseidon-prod/overlook/local-abdomen-service`
+- **Auth**: Databricks PAT via GCP Secret Manager (`mlflow_token`) → downloads models from Unity Catalog at startup
+- **Models**: CLIP v2 (`clip_rad_dino/7`, 768-dim) + 13 binary abdomen classifiers from `overlook-dev.radiology_classifier.*`
+- **13 abdomen conditions**: presumptive_post_prandial_abdomen, gastric_foreign_material_non_obstructive, decreased_peritoneal_detail, diarrhea, si_mechanical_obstruction, colonic_foreign_material, generalized_hepatomegaly, abnormal_liver_shape, abnormal_splenic_shape, mineral_in_kidney, distended_urinary_bladder, mineral_in_urinary_bladder, presumptively_normal_prostate_bph
+- **API**: POST `/infer` → `{predictions: [{target, prediction, confidence_category, version}], clip_model, images_used}`
+- **API**: POST `/embed` → `{image_embeddings: [N,768], text_embeddings: [768], images_used}`
+- Deploy: `bash infra/containers/api/local-abdomen-service/deploy-vertex-ai.sh` (from daicoe-overlook repo)
+- Local: `sudo docker compose -f infra/containers/api/local-abdomen-service/docker-compose.yml up` (requires ~/.databrickscfg)
+- **This is the existing classifier infrastructure for Phase 2b** — MCP server wraps this endpoint rather than loading PyTorch models directly
+
+### Session 7 — 2026-02-18
+
+**Status**: Phase 1 complete. All extraction, entity resolution (baseline + augmented), graph construction, Neo4j loading, and interactive explorer done. Abdomen classifier service deployed on Vertex AI. Moving to **Phase 2: Agent + Tool Integration**.
+
+**Next steps** (at end of session 7):
+1. ~~**2a. MCP Server: KG Query Tool**~~ — DONE (session 8)
+2. ~~**2b. MCP Server: Classifier Integration**~~ — DONE (session 8)
+3. **2d. Claude Code Skills** — `analyze-study`, `build-report`, `explore-kg`
+4. **2e. Graph path matching algorithm** — Soft node matching, neighborhood expansion, composite scoring
+
+### Session 8 — 2026-02-18
+
+**Phase 2a: MCP Server KG Query Tool — DONE**
+- `mcp_servers/kg_server.py` — 8 MCP tools backed by NetworkX (in-memory) + Neo4j (Cypher)
+  - `get_graph_stats()`: summary stats (node/edge counts, freq distributions, top nodes/edges)
+  - `search_nodes(query, entity_type, limit)`: substring search on canonical names
+  - `get_node_details(entity_id)`: full node attributes + connections + related diagnostic paths
+  - `get_subgraph(entity_id, hops)`: 1-2 hop ego graph
+  - `query_diagnostic_paths(findings, anatomy, condition, min_importance, limit)`: filter/rank ANATOMY ← FINDING → CONDITION paths
+  - `get_pertinent_negatives(anatomy, finding, limit)`: explicitly absent findings
+  - `get_differentials(findings, anatomy, limit)`: **flagship tool** — ranked differential diagnoses from findings
+  - `run_cypher(query)`: read-only Cypher against Neo4j (write ops blocked)
+- Graph loaded at import time from `output/graph_1000.json` + `output/graph_1000_stats.json`
+- Registered in `.mcp.json` for Claude Code auto-discovery
+
+**Phase 2b: MCP Server Classifier Integration — DONE**
+- `mcp_servers/classifier_server.py` — 2 MCP tools proxying to Vertex AI endpoint
+  - `classify_abdomen(image_url, patient)`: condition predictions from 13 binary classifiers
+  - `get_embeddings(image_url, patient)`: 768-dim CLIP embeddings
+- Proxies to `local-abdomen-service` on Vertex AI (`aicoe-poseidon-prod`, `us-central1`)
+- Auth via `gcloud auth print-access-token`
+
+**Marimo Notebook Enhanced — DONE**
+- Added 2 new tabs to `notebooks/06_kg_explorer.py` (6 → 8 tabs total)
+  - **Tab 7: Differential Diagnosis Finder** — enter findings + anatomy filter → ranked conditions via MCP `get_differentials`, plotly bar chart + evidence table + raw JSON accordion
+  - **Tab 8: MCP Tools Explorer** — pick any of 6 MCP tools, fill dynamic params, execute, see formatted results + raw JSON
+- MCP tool functions imported directly as Python (no server overhead) — demonstrates that `@mcp.tool()` decorated functions remain callable
+- Graceful fallback if MCP imports fail (`mcp_available` flag)
+
+**Status**: Phase 2a + 2b complete. Phase 2d + 2e are next. Ready for **Phase 2d (Claude Code Skills)** and **Phase 2e (Graph Path Matching Algorithm)**, then Phase 3 (Human-in-the-Loop Workflow).
+
+**Next steps**:
+1. **2e. Graph path matching algorithm** — Soft node matching via CXRBert embeddings, neighborhood expansion, composite scoring (s_match × s_freq × s_complete). This is the core intelligence layer.
+2. **2d. Claude Code Skills** — `analyze-study` (full workflow), `build-report` (ACVR format), `explore-kg` (interactive exploration)
+3. **Phase 3: Human-in-the-Loop Workflow** — Evaluator-optimizer interaction loop between agent and radiologist
+
+### Sessions 9-10 — 2026-02-18/19
+
+**Phase 2e: Graph Path Matching + Bayesian Scoring — DONE**
+- `bonegodkg/bayes.py` — Bayesian conditional probabilities for finding-condition pairs
+  - P(F|C) sensitivity, P(C) prevalence, lift, log-likelihood ratio (LLR)
+  - Built from co-occurrence analysis across 1,000 reports
+  - Output: `output/graph_1000_bayes.json` (66K Bayesian edges, 15K pertinent neg weights)
+- `bonegodkg/session.py` — DiagnosticSession engine with stateful evidence accumulation
+  - Composite scoring: `composite = s_match^α × s_freq^β × s_complete^γ` (α=1.0, β=0.5, γ=0.8)
+  - s_freq enhanced by Bayesian LLR (sigmoid transform)
+  - Soft matching: cosine similarity on precomputed 768-dim CLIP embeddings (`output/node_embeddings.npz`)
+  - Evidence types: classifier_positive/negative, radiologist_confirmed/denied/finding
+  - Pruning: rejection cache with reasons, auto-restore on evidence invalidation
+  - Near-misses: pruned paths with ≤1 reason — candidates for radiologist questions
+- `scripts/precompute_embeddings.py` — precomputes node (430) and classifier (13) embeddings
+  - Output: `output/node_embeddings.npz`, `output/classifier_embeddings.npz`
+
+**Phase 2 KG Server: Session + Bayesian tools added — DONE**
+- Added 9 tools to `mcp_servers/kg_server.py` (8 original + 9 new = 17 total):
+  - `soft_match_nodes(embedding)`: cosine similarity against 430 node embeddings
+  - `soft_match_classifier(condition_key)`: match classifier condition to KG nodes
+  - `start_session()` / `add_evidence()` / `get_session_state()`: stateful diagnostic sessions
+  - `prune_path()` / `get_near_misses()`: diagnostic path management
+  - `get_bayesian_scores(findings, condition)`: P(F|C), lift, LLR lookup
+- Precomputed embeddings loaded at server startup from `.npz` files
+
+**Phase 2d: Claude Code Skills — DONE**
+- `.claude/commands/analyze-study.md` — 8-step radiograph analysis workflow:
+  1. Classify + get embeddings → 2. Start session → 3. Register evidence → 4. Pertinent negatives → 5. Present findings → 6. Ask radiologist → 7. Iterate → 8. Final summary
+- `.claude/commands/build-report.md` — ACVR-format report generation from session state
+- `.claude/commands/explore-kg.md` — Interactive KG exploration
+
+**Classifier Vertex AI Deployment — DONE**
+- Deployed `local-abdomen-service` container to Vertex AI
+  - Endpoint ID: `4194679740918923264` (`aicoe-poseidon-prod/us-central1`)
+  - g2-standard-4 + 1x NVIDIA L4 GPU (~$1.50/hr)
+  - Tested: /health, /models, /infer all working
+- Created deployment/management scripts:
+  - `scripts/deploy_classifier.sh` — gcloud deploy command
+  - `scripts/services.sh` — status/start/stop/health for all services
+- Auth: DATABRICKS_TOKEN env var (bypasses Secret Manager for simpler deploy)
+
+**Sample Images Downloaded — DONE**
+- `scripts/download_sample_images.py` — downloads from Databricks/S3 via presigned URLs
+- 3 test cases in `output/sample_images/`:
+  - Case 5478809: Cockapoo, 21 lbs — enlarged liver with lobulated margins (neoplasia suspected)
+  - Case 4560099: Mini Aussie, 18 lbs — chronic diarrhea, questionable peritoneal effusion, small liver
+  - Case 5669457: Bulldog, 39 lbs — food bloat + possible foreign body, distended stomach
+
+### Session 11-12 — 2026-02-19
+
+**End-to-End Pipeline Test — DONE (with issues identified)**
+- Tested full `/analyze-study` workflow on case 5669457 (Bulldog food bloat):
+  - Classifier MCP: returned 11/13 predictions (2 missing: `post_prandial`, `gastric_foreign_material`)
+  - KG session: accumulated 5 evidence items, scored 10 active paths (all hepatomegaly-related)
+  - Pertinent negatives: relevant results for stomach, small intestine, liver
+  - Differentials: aerophagia (16), gastroenteritis (9), pancreatitis (8)
+
+**Bug Fixes — DONE**
+- `mcp_servers/kg_server.py`: Fixed `soft_match_classifier()` return type `list[dict]` → `dict` (Pydantic validation error)
+- `mcp_servers/classifier_server.py`: Fixed target name mismatch between Vertex AI endpoint and MCP server
+  - Added `_BACKEND_TO_SHORT` mapping (13 entries) for backend → canonical short key translation
+  - Added `_normalize_predictions()` to standardize output and mark missing classifiers as "unavailable"
+  - Added `summary` field (positive/negative/unavailable lists) to classify_abdomen response
+
+**Issues Identified**:
+1. **2 classifiers unavailable**: `post_prandial` and `gastric_foreign_material` not returned by Vertex AI endpoint — likely model loading failure on the container (Databricks model versions may not exist for these)
+2. **Session paths too condition-centric**: SI mechanical obstruction matched perfectly (similarity 1.0) but didn't generate active paths — session engine needs finding + anatomy edges, not just condition match
+3. **Findings classifiers not yet integrated**: The existing 13 classifiers are condition-level only. User will help set up findings-level classifiers next
+
+**Status**: Phase 2 substantially complete. End-to-end pipeline functional but needs MCP server restart to pick up fixes. **Next: set up findings classifiers with user, then retest**.
+
+### Session 13 — 2026-02-19
+
+**Findings Classifiers Integration — DONE (MCP tool working)**
+- Added 17 pytorch-frame Trompt models to `mcp_servers/classifier_server.py`
+  - `classify_findings` tool: gets CLIP embeddings from Vertex AI, runs Trompt inference on CPU
+  - Models cached in `models/findings/`, ~1MB each, 80K params each
+  - All 17 models load successfully from Databricks MLflow registry (`overlook-dev.findings.*`)
+- MCP server restarted; both KG and classifier servers verified working
+
+### Session 14 — 2026-02-19
+
+**Findings Classifier Testing — CRITICAL BUG IDENTIFIED**
+- Tested `classify_findings` on all 3 sample cases:
+  - Case 5478809 (Cockapoo, hepatomegaly): 17/17 positive — all positive
+  - Case 4560099 (Mini Aussie, diarrhea): 17/17 positive — all positive
+  - Case 5669457 (Bulldog, food bloat): 17/17 positive — all positive
+- Raw probabilities extracted by bypassing pyfunc predict():
+  - Most probabilities cluster 0.10–0.50 range with little discrimination
+  - At 0.5 threshold: only 1-3 positives per case (better but still inaccurate)
+- **User confirmed**: production Databricks inference on the SAME case 5478809 produces correct negatives (e.g., `segmental_si_dilation` = negative) using the same Kneedle thresholds
+- **Root cause hypothesis: CLIP embedding version mismatch**
+  - Training notebook renames column `clip_vector_v1` → `image_embeddings`
+  - Our Vertex AI endpoint serves CLIP **v7** (`clip_rad_dino/7`)
+  - If models were trained on CLIP v1 embeddings but we feed them v7 embeddings, the probability distributions would be completely different
+  - This explains why all probabilities are "mushy" in the 0.1–0.5 range — the embedding space is mismatched
+- **Secondary hypothesis**: Image quality — we downloaded `.dcm.medium.jpg` thumbnails, production may use full DICOM
+- **Confirmed**: The issue is NOT thresholds. Do NOT adjust Kneedle thresholds or raw probabilities.
+
+**Next steps (Session 15)**:
+1. **Verify CLIP version used in findings training** — check what `clip_vector_v1` actually refers to in the Databricks findings parquet files. Compare against CLIP v7 embeddings from Vertex AI.
+2. **Match CLIP version** — either:
+   - (a) Re-generate embeddings using the correct CLIP version locally, or
+   - (b) Update the Vertex AI endpoint to serve the correct CLIP version, or
+   - (c) Find out how production Databricks generates embeddings and replicate that path
+3. **Retest** — once embeddings match, rerun findings classifiers on all 3 cases and compare against production Databricks output
+
+---
+
+## Part 6: Verification & Testing Plan
+
+1. **KG Quality**: Run extraction on 100 reports, have vet radiologist review entity/relation accuracy
+2. **Path Matching**: Given known cases, verify top-ranked paths match expected diagnoses
+3. **Agent Workflow**: Walk through 5 sample cases end-to-end with a radiologist
+4. **Report Quality**: Compare generated reports against original report for same study
+5. **Gap Analysis**: Verify that missing edges identified by agent are clinically meaningful
+
+---
+
+## Part 7: Confirmed Implementation Details
+
+- **Report format**: Mixed (some structured with Findings/Impression, some free-text) -> need preprocessing step
+- **Model access**: Python API/scripts (PyTorch/HuggingFace) -> wrap in MCP server
+- **Graph storage**: Neo4j + MCP -> Docker-based, with Neo4j MCP server for Claude integration
+- **Textbook content**: Available -> integrate as secondary KG source or RAG corpus
+
+## Part 8: Key Dependencies & Setup
+
+```bash
+# Dependencies managed via uv (see pyproject.toml)
+uv add google-genai pydantic networkx neo4j  # + others
+
+# Neo4j (Docker Compose at project root)
+sudo docker compose up -d          # start Neo4j 5 Community
+python scripts/load_neo4j.py --clear  # load KG (430 nodes, 712 edges)
+# Browse: http://localhost:7474 (neo4j/bonegodkg)
+
+# MCP servers (to be built — Phase 2)
+# 1. kg-query-server (Neo4j Cypher + NetworkX graph operations)
+# 2. classifier-server (wraps your PyTorch models)
+# 3. textbook-rag-server (stretch goal)
+
+# Your existing models
+# - ViT+SigLIP condition classifier
+# - ViT+SigLIP findings classifier
+# - Hanging rules model
+# - CXRBert text encoder (v4, used for entity resolution embeddings)
+```
+
+## Future Work (Post-Hackathon)
+
+- **Abbreviation lookup table (Pass C)**: CXRBert CLIP cannot resolve short medical abbreviations (CCL, GDV, IVDD, CVC) — they embed into generic regions. Curate a vet radiology acronym → expansion table (or LLM-generate one) and apply as pre-processing before embedding. See 1c-augmented Pass C notes.
+- **VetSCT Integration**: Map KG entities to Veterinary SNOMED-CT codes for interoperability and standardized terminology. Requires signup/approval at [vtsl.vetmed.vt.edu](https://vtsl.vetmed.vt.edu/extension/).
+- **Production agentic framework**: Evaluate migration from Claude Code + MCP to CrewAI or similar for multi-user deployment
+- **Multi-species support**: Extend KG schema and classifiers beyond canine to feline and other species
+- **Continuous KG enrichment**: Pipeline to ingest new reports and update the KG incrementally
+- **Evaluation framework**: Formal radiologist evaluation study comparing report quality with/without the co-pilot
+
+---
+
+## Sources & References
+
+### Primary Sources (User-Provided)
+- [KARGEN](https://arxiv.org/html/2409.05370v1) - Knowledge-enhanced radiology report generation
+- [RadGraph](https://physionet.org/content/radgraph/1.0.0/) - Radiology entity/relation extraction dataset & models
+- [Semantic Entity Resolution](https://blog.graphlet.ai/the-rise-of-semantic-entity-resolution-45c48d5eb00a) - KG entity merging techniques
+- [RadExtract / LangExtract](https://github.com/google/langextract) - Google's structured text extraction library
+- [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) - Anthropic's agent architecture guide
+
+### Additional SOTA Discovered
+- [ReXKG](https://github.com/rajpurkarlab/ReXKG) - Complete radiology KG construction pipeline (open source)
+- [R2GenKG](https://arxiv.org/html/2508.03426) - Multi-modal medical KG with multi-scale graph views
+- [RadGraph-XL](https://aclanthology.org/2024.findings-acl.765/) - 410K+ entities across multiple modalities
+- [Stanford AIMI radgraph package](https://github.com/Stanford-AIMI/radgraph) - `pip install radgraph`
+- [BiomedCLIP](https://arxiv.org/abs/2303.00915) - 15M biomedical image-text pairs foundation model
+- [Agentic AI in Radiology](https://pmc.ncbi.nlm.nih.gov/articles/PMC12515039/) - 2025 emerging potential review
+- [GE Healthcare Agentic Radiology](https://research.gehealthcare.com/patient-care-pathways/reinventing-radiology-imaging-workflows-with-agentic-ai-jb35459xx/) - Industry perspective
+
+### Veterinary-Specific
+- [LiteralKG - Companion Animal Disease KG](https://arxiv.org/abs/2309.03219) - KG from veterinary EMRs
+- [ACVR/ECVDI Consensus on Imaging Reports](https://pmc.ncbi.nlm.nih.gov/articles/PMC11649853/) - Vet report structure standard
+- [SignalPET vs Radiologists](https://www.frontiersin.org/journals/veterinary-science/articles/10.3389/fvets.2025.1502790/full) - 2025 AI comparison study
+- [VetSCT](https://vtsl.vetmed.vt.edu/extension/) - Veterinary SNOMED-CT Extension
+- [Neo4j MCP for Claude](https://neo4j.com/blog/developer/knowledge-graphs-claude-neo4j-mcp/) - Graph database + Claude integration
+- [LangExtract Docs](https://developers.google.com/health-ai-developer-foundations/libraries/langextract) - Google extraction library
