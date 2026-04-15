@@ -45,3 +45,7 @@ Storage: GraphFrames → Delta tables for Phase 2
 ```
 - **Critical Integration Note:** spaCy tokenization is required for GliREL to work with GliNER entities. GliREL operates at the token level (not character level), so spaCy converts GliNER's character-based entity spans to token indices. This is the proven approach from my `Relation_Extraction` experiments notebook.
 
+---
+## 4. Diagnostic KG Graph Agentic Rad System POC
+- These are notes from an agentic KG system an colleague and I built for Veterinary medicine. It was built with human radiology model components so it could be potentially useful.
+- However, not it was built with CLIP models in mind (they were using CLIP encoder models for image classification for FINDINGS text). CLIP is a model that Open AI released that embeds images and text in the same embedding space. 
