@@ -4,6 +4,8 @@
 ---
 # Important Resources to check out:
 - GraphRAG with Amazon Neptune. Paco Nathan is a former Stanford processor and graph guru. He talks about the importance of entity resolution using AWS neptune: https://senzing.com/graphrag-amazon-aws-neptune-bedrock/
+- [Semantic Similarity in Radiology Reports via LLMs and NER](https://arxiv.org/html/2510.03102v2)
+- [The Rise of Semantic Entity Resolution](https://blog.graphlet.ai/the-rise-of-semantic-entity-resolution-45c48d5eb00a)
 
 
 
