@@ -5,6 +5,23 @@
 ---
 # Important Research
 
+## Important References to look at
+- **Semantic Entity Resolution (SERF):** [Towards Data Science](https://towardsdatascience.com/the-rise-of-semantic-entity-resolution/), [GitHub](https://github.com/Graphlet-AI/serf), [WordLift - DSPy and LangExtract](https://wordlift.io/)
+- **RadEval Paper:** [arxiv.org/html/2509.18030](https://arxiv.org/html/2509.18030)
+- **RadEval ModernBERT Model Card:** [huggingface.co/IAMJB/RadEvalModernBERT](https://huggingface.co/IAMJB/RadEvalModernBERT)
+- **RadGraph:** [PhysioNet](https://physionet.org/content/radgraph/1.0.0/), [GitHub](https://github.com/Stanford-AIMI/radgraph), RadGraph paper, RadGraph-XL paper
+- **GraphFrames Embeddings:** [semyonsinchenko.github.io](https://semyonsinchenko.github.io/ssinchenko/post/graphframes-embeddings/)
+- **GliNER with GliREL:** [DerwenAI/strwythura](https://github.com/DerwenAI/strwythura/blob/main/archive/construct.ipynb)
+- **GraphFrames Documentation:** [graphframes.io](https://graphframes.io/table-of-content.html)
+- **PySpark Style Guide:** [rjurney gist](https://gist.github.com/rjurney/9b1ea6ed19b0e27dab02d9d77eb57002)
+- **Hoang et al., 2023.** Companion Animal Disease Diagnostics Based on Literal-Aware Medical Knowledge Graph Representation Learning. [arxiv.org/pdf/2309.03219](https://arxiv.org/pdf/2309.03219)
+- **Li et al., 2024.** KARGEN: Knowledge-enhanced Automated Radiology Report Generation Using Large Language Models. [arxiv.org/html/2409.05370v1](https://arxiv.org/html/2409.05370v1)
+- **Mou et al., 2024.** Knowledge Graph-enhanced Vision-to-Language Multimodal Models for Radiology Report Generation. [ESWC 2024](https://2024.eswc-conferences.org/wp-content/uploads/2024/05/77770446.pdf)
+
+
+
+
+---
 ## Knowledge Graphs 
 * Chen et al, 2025. GraphCheck: Breaking Long-Term Text Barriers with Extracted Knowledge Graph-Powered Fact-Checking.
   * Link: https://arxiv.org/abs/2502.16514
