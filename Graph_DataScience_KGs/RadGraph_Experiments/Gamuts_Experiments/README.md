@@ -2,12 +2,11 @@
 - These are previous experiments I had done with the Gamuts ontology (differential diagnosis ontology of human radiology). 
 - I downloaded the CSV version of Gamuts via the bioportal: https://bioportal.bioontology.org/ontologies/GAMUTS
 - It is also accessible via the website: https://www.gamuts.net/
+---
+# Code to experiment with Gamuts
+- I will upload the code here. check back soon. 
 
-## Other related ontologies to try in future (Anatomy related)
-- Anatomy:
-  - https://bioportal.bioontology.org/ontologies/FMA
-  - http://sig.biostr.washington.edu/projects/fm/AboutFM.html
-  - https://www.anatomiclocations.org/hierarchy/
+
 
 ---
 # Gamuts Download notes
@@ -20,3 +19,10 @@
 2. Uploaded to DBFS on Databricks
 3. Parseed with rdflib (pure Python package, no GPU needed)
 ```
+
+---
+## Other related ontologies to try in future (Anatomy related)
+- Anatomy:
+  - https://bioportal.bioontology.org/ontologies/FMA
+  - http://sig.biostr.washington.edu/projects/fm/AboutFM.html
+  - https://www.anatomiclocations.org/hierarchy/
