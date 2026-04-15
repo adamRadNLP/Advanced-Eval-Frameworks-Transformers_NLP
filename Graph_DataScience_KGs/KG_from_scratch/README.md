@@ -28,4 +28,20 @@
   - Polars is a high-performance, open-source DataFrame library that provides fast and efficient data processing capabilities, especially valuable when dealing with large datasets (BIG DATA). It was built with Rust, a language known for its speed and safety, and offers Python, R, and NodeJS wrappers. For more about Polars see documention.
 
 ---
+## 3. POC_Veterinary_RadGraph_pipeline.ipynb
+- This was a more modular graph pipeline that I built to adopt the human RadGraph model for veterinary medical records.
+- **Each component is grounded in my knowledge and experience in clinical NLP and Graph Data Science. I built this with purpose, it was not vibe coded. The individual components were carefully constructed.** You don't need all the components to be successful, but I will tell you that I chose each component with purpose after extensive research and experimentation.
+- These are the key components:
+```
+Entity Extraction: GliNER-BioMed-large (biomedical-specialized, +5.96% over baselines)
+Tokenization: spaCy en_core_web_sm (token-level mapping for GliREL)
+Relation Extraction: GliREL (state-of-the-art, typed relationships with pre-extracted entities)
+Semantic Resolution: DSPy framework (Russell Jurney-inspired entity deduplication with Radiology specific embedding model: IAMJB/RadEvalModernBERT)
+Graph Construction: NetworkX directed graphs with typed edges
+Graph Algorithms: 9 RadGraph-inspired structural analysis algorithms
+Metrics: 24 comprehensive quality metrics
+Storage: GraphFrames → Delta tables for Phase 2
+
+```
+- **Critical Integration Note:** spaCy tokenization is required for GliREL to work with GliNER entities. GliREL operates at the token level (not character level), so spaCy converts GliNER's character-based entity spans to token indices. This is the proven approach from my `Relation_Extraction` experiments notebook.
 
