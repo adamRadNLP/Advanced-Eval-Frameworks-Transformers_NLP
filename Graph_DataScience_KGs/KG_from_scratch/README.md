@@ -51,4 +51,35 @@ Storage: GraphFrames → Delta tables for Phase 2
 - However, not it was built with CLIP models in mind (they were using CLIP encoder models for image classification for FINDINGS text). CLIP is a model that Open AI released that embeds images and text in the same embedding space.
 ---
 ## 5. Custom RadGraph Architecture 
-- Document describing an approach to create a RadGraph-inspired veterinary radiology report evaluation using entity-relationship graphs. 
+- Document describing an approach to create a RadGraph-inspired veterinary radiology report evaluation using entity-relationship graphs.
+
+---
+## 6. radiology_knowledge_graph_notebook.py
+- What This Notebook Does -- Extracts a **knowledge graph** from radiology report text using:
+1. **GliNER-BioMed** -- extracts clinical entities (anatomy, observations, diseases)
+2. **GliREL** -- extracts typed relationships between entities (located_at, suggestive_of, modify)
+3. **NetworkX** -- builds a directed graph from the entities and relationships
+4. **pyvis** -- creates an interactive HTML visualization you can explore in your browser
+
+### Pipeline 
+```
+Report Text --> GliNER-BioMed (entities) --> spaCy (tokenization) --> GliREL (relationships)
+            --> NetworkX (graph) --> pyvis (interactive visualization)
+```
+### RadGraph Schema (default labels)
+- **Entities:**
+  - Anatomy definitely present (ANAT-DP)
+  - Observation definitely present (OBS-DP)
+  - Observation definitely absent (OBS-DA) -- negation!
+  - Observation uncertain (OBS-U)
+
+- **Relationships:**
+  - `suggestive_of`: OBS --> OBS (diagnostic inference)
+  - `located_at`: OBS --> ANAT (anatomical localization)
+  - `modify`: Any --> Any (descriptor modification)
+
+### Important Notes
+  - spaCy tokenization is **required** for GliREL. GliREL operates at the token level, so spaCy converts GliNER's character-based entity spans to token indices.
+  - GliREL's `ner=` parameter (not `entities=`) is the correct API.
+  - GliREL returns token LISTS for head/tail text, not strings. Must join them.
+  - Threshold of 0.05 works well for radiology. Default 0.3 is too strict.
